@@ -7,14 +7,18 @@
          ping/0,
          entry/2,
          get/2,
+         get/3,
          set/3,
          append/3,
          incr/2,
          incrby/3,
-         sadd/3
+         sadd/3,
+         srem/3
         ]).
+
 -export([get_dbg_preflist/2,
-         get_dbg_preflist/3]).
+         get_dbg_preflist/3,
+         dbg_op/5, dbg_op/6]).
 -define(TIMEOUT, 5000).
 
 %%%===================================================================
@@ -38,21 +42,26 @@ entry(Client, Entry) ->
 
 %% @doc Get a stat's value.
 get(Client, StatName) ->
-    {ok, ReqID} = rts_get_fsm:get(Client, StatName),
-    wait_for_reqid(ReqID, ?TIMEOUT).
+    get(Client, StatName, []).
+
+get(Client, StatName, Opts) ->
+    {ok, ReqID} = rts_get_fsm:get(Client, StatName, Opts),
+    {ok, Val} = wait_for_reqid(ReqID, ?TIMEOUT),
+    pretty_print(Val).
 
 get_dbg_preflist(Client, StatName) ->
-    DocIdx = riak_core_util:chash_key({list_to_binary(Client),
-                                       list_to_binary(StatName)}),
-    riak_core_apl:get_apl(DocIdx, ?N, rts_stat).
+    [get_dbg_preflist(Client, StatName, N) || N <- lists:seq(1,3)].
 
 get_dbg_preflist(Client, StatName, N) ->
-    IdxNode = lists:nth(N, get_dbg_preflist(Client, StatName)),
-    {ok, req_id, Val} =
+    DocIdx = riak_core_util:chash_key({list_to_binary(Client),
+                                       list_to_binary(StatName)}),
+    Preflist = riak_core_apl:get_apl(DocIdx, ?N, rts_stat),
+    IdxNode = lists:nth(N, Preflist),
+    {ok, req_id, _, Val} =
         riak_core_vnode_master:sync_command(IdxNode,
                                             {get, req_id, StatName},
                                             rts_stat_vnode_master),
-    [IdxNode, Val].
+    {IdxNode, Val}.
 
 %% @doc Set a stat's value, replacing the current value.
 set(Client, StatName, Val) ->
@@ -70,9 +79,38 @@ incr(Client, StatName) ->
 incrby(Client, StatName, Val) ->
     do_write(Client, StatName, incrby, Val).
 
-%% @doc Add a memeber to the stat's set.
+%% @doc Add a member to the stat's set.
 sadd(Client, StatName, Val) ->
     do_write(Client, StatName, sadd, Val).
+
+%% @doc Remove a member from the stat's set.
+srem(Client, StatName, Val) ->
+    do_write(Client, StatName, srem, Val).
+
+%% @doc Fake a partitioned `Op' to the given `Nodes' from the given
+%% `Coordinator'.  That is, this op will act as if the given nodes are
+%% partitioned from the rest of the cluster.  Let the replies fall on
+%% the caller's mailbox.
+-spec dbg_op(atom(), node(), [node()], string(), string()) -> ok.
+dbg_op(Op, Coordinator, Nodes, Client, StatName) ->
+    dbg_op(Op, Coordinator, Nodes, Client, StatName, undefined).
+
+-spec dbg_op(atom(), node(), [node()], string(), string(), term()) -> ok.
+dbg_op(Op, Coordinator, Nodes, Client, StatName, Val) ->
+    ReqID = mk_reqid(),
+    DocIdx = riak_core_util:chash_key({list_to_binary(Client),
+                                       list_to_binary(StatName)}),
+    Preflist = riak_core_apl:get_apl(DocIdx, ?N, rts_stat),
+    P = fun({_Idx,Node}) ->
+                lists:member(Node, [Coordinator|Nodes])
+        end,
+    Targets = lists:filter(P, Preflist),
+    case Val of
+        undefined ->
+            rts_stat_vnode:Op(Targets, {ReqID, Coordinator}, StatName);
+        _ ->
+            rts_stat_vnode:Op(Targets, {ReqID, Coordinator}, StatName, Val)
+    end.
 
 %%%===================================================================
 %%% Internal Functions
@@ -92,3 +130,11 @@ wait_for_reqid(ReqID, Timeout) ->
     after Timeout ->
 	    {error, timeout}
     end.
+
+mk_reqid() -> erlang:phash2(erlang:now()).
+
+pretty_print(#incr{total=Total}) -> Total;
+pretty_print(Val) when element(1, Val) == statebox ->
+    pretty_print(statebox:value(Val));
+pretty_print(Val) when element(1, Val) == set -> sets:to_list(Val);
+pretty_print(Val) -> Val.

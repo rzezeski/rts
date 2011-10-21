@@ -69,8 +69,8 @@ handle_command({entry, Client, Entry}, _Sender, #state{reg=Reg}=State) ->
     lists:foreach(match(Client, Entry), Reg),
     {noreply, State}.
 
-handle_handoff_command(_Message, _Sender, State) ->
-    {noreply, State}.
+handle_handoff_command(Req, _Sender, State) ->
+    handle_command(Req, _Sender, State).
 
 handoff_starting(_TargetNode, _State) ->
     {true, _State}.
@@ -96,8 +96,8 @@ delete(State) ->
 handle_coverage(_Req, _KeySpaces, _Sender, State) ->
     {stop, not_implemented, State}.
 
-handle_exit(_Pid, _Reason, State) ->
-    {noreply, State}.
+handle_exit(_Pid, _Reason, _State) ->
+    {noreply, _State}.
 
 terminate(_Reason, _State) ->
     ok.

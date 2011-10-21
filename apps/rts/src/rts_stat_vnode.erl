@@ -23,13 +23,15 @@
 -export([
          get/3,
          set/4,
+         repair/3,
          incr/3,
          incrby/4,
          append/4,
-         sadd/4
+         sadd/4,
+         srem/4
         ]).
 
--record(state, {partition, stats}).
+-record(state, {partition, stats, node}).
 
 -define(MASTER, rts_stat_vnode_master).
 -define(sync(PrefList, Command, Master),
@@ -48,32 +50,47 @@ get(Preflist, ReqID, StatName) ->
                                    {fsm, undefined, self()},
                                    ?MASTER).
 
-set(Preflist, ReqID, StatName, Val) ->
+set(Preflist, Identity, StatName, Val) ->
     riak_core_vnode_master:command(Preflist,
-                                   {set, ReqID, StatName, Val},
+                                   {set, Identity, StatName, Val},
+                                   ?MASTER).
+
+%% @doc Attempt to repair -- fire and forget.
+repair(IdxNode, StatName, Obj) ->
+    riak_core_vnode_master:command(IdxNode,
+                                   {repair, undefined, StatName, Obj},
+                                   ignore,
                                    ?MASTER).
 
 %% TODO: I have to look at the Sender stuff more closely again
-incr(Preflist, ReqID, StatName) ->
+incr(Preflist, Identity, StatName) ->
     riak_core_vnode_master:command(Preflist,
-                                   {incr, ReqID, StatName},
+                                   {incrby, Identity, StatName, 1},
                                    {fsm, undefined, self()},
                                    ?MASTER).
 
-incrby(Preflist, ReqID, StatName, Val) ->
+incrby(Preflist, Identity, StatName, Val) ->
     riak_core_vnode_master:command(Preflist,
-                                   {incrby, ReqID, StatName, Val},
+                                   {incrby, Identity, StatName, Val},
                                    {fsm, undefined, self()},
                                    ?MASTER).
 
-append(Preflist, ReqID, StatName, Val) ->
+append(Preflist, Identity, StatName, Val) ->
     riak_core_vnode_master:command(Preflist,
-                                   {append, ReqID, StatName, Val},
+                                   {append, Identity, StatName, Val},
+                                   {fsm, undefined, self()},
                                    ?MASTER).
 
-sadd(Preflist, ReqID, StatName, Val) ->
+sadd(Preflist, Identity, StatName, Val) ->
     riak_core_vnode_master:command(Preflist,
-                                   {sadd, ReqID, StatName, Val},
+                                   {sadd, Identity, StatName, Val},
+                                   {fsm, undefined, self()},
+                                   ?MASTER).
+
+srem(Preflist, Identity, StatName, Val) ->
+    riak_core_vnode_master:command(Preflist,
+                                   {srem, Identity, StatName, Val},
+                                   {fsm, undefined, self()},
                                    ?MASTER).
 
 %%%===================================================================
@@ -81,9 +98,10 @@ sadd(Preflist, ReqID, StatName, Val) ->
 %%%===================================================================
 
 init([Partition]) ->
-    {ok, #state { partition=Partition, stats=dict:new() }}.
+    {ok, #state { partition=Partition, stats=dict:new(), node=node() }}.
 
-handle_command({get, ReqID, StatName}, _Sender, #state{stats=Stats}=State) ->
+handle_command({get, ReqID, StatName}, _Sender,
+               #state{stats=Stats, partition=Partition, node=Node}=State) ->
     Reply =
         case dict:find(StatName, Stats) of
             error ->
@@ -91,31 +109,75 @@ handle_command({get, ReqID, StatName}, _Sender, #state{stats=Stats}=State) ->
             {ok, Found} ->
                 Found
         end,
-    {reply, {ok, ReqID, Reply}, State};
+    {reply, {ok, ReqID, {Partition,Node}, Reply}, State};
 
-handle_command({set, ReqID, StatName, Val}, _Sender, #state{stats=Stats0}=State) ->
+handle_command({set, {ReqID, _}, StatName, Val}, _Sender, #state{stats=Stats0}=State) ->
     Stats = dict:store(StatName, Val, Stats0),
     {reply, {ok, ReqID}, State#state{stats=Stats}};
 
-handle_command({incr, ReqID, StatName}, _Sender, #state{stats=Stats0}=State) ->
-    Stats = dict:update_counter(StatName, 1, Stats0),
+handle_command({repair, undefined, StatName, Obj}, _Sender, #state{stats=Stats0}=State) ->
+    error_logger:error_msg("repair performed ~p~n", [Obj]),
+    Stats = dict:store(StatName, Obj, Stats0),
+    {noreply, State#state{stats=Stats}};
+
+handle_command({incrby, {ReqID, Coordinator}, StatName, IncrBy}, _Sender, #state{stats=Stats0}=State) ->
+    Obj =
+        case dict:find(StatName, Stats0) of
+            {ok, #rts_obj{val=#incr{total=T0, counts=C0}}=O} ->
+                T = T0 + IncrBy,
+                C = dict:update_counter(Coordinator, IncrBy, C0),
+                Val = #incr{total=T, counts=C},
+                rts_obj:update(Val, Coordinator, O);
+            error ->
+                Val = #incr{total=IncrBy,
+                            counts=dict:from_list([{Coordinator, IncrBy}])},
+                VC0 = vclock:fresh(),
+                VC = vclock:increment(Coordinator, VC0),
+                #rts_obj{val=Val, vclock=VC}
+        end,
+    Stats = dict:store(StatName, Obj, Stats0),
     {reply, {ok, ReqID}, State#state{stats=Stats}};
 
-handle_command({incrby, ReqID, StatName, Val}, _Sender, #state{stats=Stats0}=State) ->
-    Stats = dict:update_counter(StatName, Val, Stats0),
-    {reply, {ok, ReqID}, State#state{stats=Stats}};
-
-handle_command({append, ReqID, StatName, Val}, _Sender, #state{stats=Stats0}=State) ->
+handle_command({append, {ReqID, _}, StatName, Val}, _Sender, #state{stats=Stats0}=State) ->
     Stats = try dict:append(StatName, Val, Stats0)
             catch _:_ -> dict:store(StatName, [Val], Stats0)
             end,
     {reply, {ok, ReqID}, State#state{stats=Stats}};
 
-handle_command({sadd, ReqID, StatName, Val}, _Sender, #state{stats=Stats0}=State) ->
-    F = fun(S) ->
-                sets:add_element(Val, S)
+handle_command({sadd, {ReqID, Coordinator}, StatName, Val},
+               _Sender, #state{stats=Stats0}=State) ->
+    SB = 
+        case dict:find(StatName, Stats0) of
+            {ok, #rts_obj{val=SB0}=O} ->
+                SB1 = statebox:modify({sets, add_element, [Val]}, SB0),
+                SB2 = statebox:expire(?STATEBOX_EXPIRE, SB1),
+                rts_obj:update(SB2, Coordinator, O);
+            error ->
+                SB0 = statebox:new(fun sets:new/0),
+                SB1 = statebox:modify({sets, add_element, [Val]}, SB0),
+                VC0 = vclock:fresh(),
+                VC = vclock:increment(Coordinator, VC0),
+                #rts_obj{val=SB1, vclock=VC}
         end,
-    Stats = dict:update(StatName, F, sets:from_list([Val]), Stats0),
+    Stats = dict:store(StatName, SB, Stats0),
+    {reply, {ok, ReqID}, State#state{stats=Stats}};
+
+handle_command({srem, {ReqID, Coordinator}, StatName, Val},
+               _Sender, #state{stats=Stats0}=State) ->
+    SB =
+        case dict:find(StatName, Stats0) of
+            {ok, #rts_obj{val=SB0}=O} ->
+                SB1 = statebox:modify({sets, del_element, [Val]}, SB0),
+                SB2 = statebox:expire(?STATEBOX_EXPIRE, SB1),
+                rts_obj:update(SB2, Coordinator, O);
+            error ->
+                SB0 = statebox:new(fun sets:new/0),
+                SB1 = statebox:modify({sets, del_element, [Val]}, SB0),
+                VC0 = vclock:fresh(),
+                VC = vclock:increment(Coordinator, VC0),
+                #rts_obj{val=SB1, vclock=VC}
+        end,
+    Stats = dict:store(StatName, SB, Stats0),
     {reply, {ok, ReqID}, State#state{stats=Stats}}.
 
 handle_handoff_command(?FOLD_REQ{foldfun=Fun, acc0=Acc0}, _Sender, State) ->
@@ -134,8 +196,13 @@ handoff_finished(_TargetNode, State) ->
     {ok, State}.
 
 handle_handoff_data(Data, #state{stats=Stats0}=State) ->
-    {StatName, Val} = binary_to_term(Data),
-    Stats = dict:store(StatName, Val, Stats0),
+    {StatName, HObj} = binary_to_term(Data),
+    MObj =
+        case dict:find(StatName, Stats0) of
+            {ok, Obj} -> rts_obj:merge([Obj,HObj]);
+            error -> HObj
+        end,
+    Stats = dict:store(StatName, MObj, Stats0),
     {reply, ok, State#state{stats=Stats}}.
 
 encode_handoff_item(StatName, Val) ->
@@ -153,8 +220,8 @@ delete(State) ->
 handle_coverage(_Req, _KeySpaces, _Sender, State) ->
     {stop, not_implemented, State}.
 
-handle_exit(_Pid, _Reason, State) ->
-    {noreply, State}.
+handle_exit(_Pid, _Reason, _State) ->
+    {noreply, _State}.
 
 terminate(_Reason, _State) ->
     ok.

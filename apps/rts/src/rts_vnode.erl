@@ -57,11 +57,11 @@ is_empty(State) ->
 delete(State) ->
     {ok, State}.
 
-handle_exit(_Pid, _Reason, _State) ->
-    {noreply, _State}.
-
 handle_coverage(_Req, _KeySpaces, _Sender, State) ->
     {stop, not_implemented, State}.
+
+handle_exit(_Pid, _Reason, _State) ->
+    {noreply, _State}.
 
 terminate(_Reason, _State) ->
     ok.
